@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseBank, publicReceipt, type AuthoringMessage, type ToolContract } from "../src/bank.ts";
+import { parseBank, publicReceipt, schemaMatches, type AuthoringMessage, type ToolContract } from "../src/bank.ts";
 import type { Policy } from "../src/policy.ts";
 
 const v1: Policy = { version: 1, enabled: true, maximum_candidates: 16, maximum_fast_steps: 16, maximum_public_bytes: 32768 };
@@ -144,4 +144,12 @@ test("single-encoding mode refuses a rewritten numeric literal", () => {
   assert.equal(publicReceipt(message, true).status, "PARSED");
   const rewritten = { role: "tool" as const, toolCallId: "n", content: [{ type: "text" as const, text: '{"return_code":01}' }] };
   assert.equal(publicReceipt(rewritten, true).status, "UNKNOWN");
+});
+
+test("schemaMatches lowers a TypeBox builder through toJsonSchema()", () => {
+  const plain = { type: "object", required: ["command"], properties: { command: { type: "string" } } };
+  const builder = { toJsonSchema: () => plain };
+  assert.equal(schemaMatches({ command: "echo x" }, builder), true, "omptype callable (OMP shim) must match after lowering");
+  assert.equal(schemaMatches({ command: 7 }, builder), false);
+  assert.equal(schemaMatches({ command: "echo x" }, plain), true, "pi's plain typebox schema passes through untouched");
 });
