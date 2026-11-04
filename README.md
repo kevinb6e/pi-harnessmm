@@ -20,7 +20,7 @@ model turn N   ── <CHISEL_PLAN> A→B→C  +  root command
 ## Install
 
 ```bash
-pi install git:github.com/jlon/pi-harnessmm
+pi install git:github.com/kevinb6e/pi-harnessmm
 ```
 
 Or try it without adding it to settings:
@@ -40,10 +40,23 @@ and the `typebox` import resolves to OMP's shim. OMP does **not** read pi's `~/.
 so install it explicitly:
 
 ```bash
-omp install git:github.com/jlon/pi-harnessmm   # or: omp install ./pi-harnessmm
+omp install git:github.com/kevinb6e/pi-harnessmm   # or: omp install ./pi-harnessmm
 # or list the checkout in ~/.omp/agent/config.yml:  extensions: [ /path/to/pi-harnessmm ]
 # or run ad hoc:                                      omp -e ./extensions/harnessmm.ts
 ```
+
+Verify it loaded:
+
+```bash
+omp plugin list        # ● pi-harnessmm@0.1.0
+omp plugin doctor      # ✔ plugin:pi-harnessmm: v0.1.0 - HarnessMM for pi: ...
+pi list                # git:github.com/kevinb6e/pi-harnessmm  <install path>
+```
+
+In a session, `/harnessmm` reports the ledger (banks authored, certified substitutions, tokens), and every banked
+turn prints `harnessmm: completed; N substitution(s) certified` above its receipts. For local development run
+straight from the checkout: `omp -e ./extensions/harnessmm.ts` or `pi -ne -e ./extensions/harnessmm.ts` — `-ne`
+drops the installed copy so the two `terminal` registrations do not conflict.
 
 Three host deltas are feature-detected in `extensions/harnessmm.ts`, plus two host-shape normalizations in
 `src/bank.ts` (`schemaMatches` lowers a TypeBox builder through `toJsonSchema()` — OMP's typebox shim returns an
