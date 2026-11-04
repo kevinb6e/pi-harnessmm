@@ -108,6 +108,14 @@ function terminalArguments(value: unknown): boolean {
 
 /** JSON-Schema subset check used to prove candidate arguments match the tool contract. */
 export function schemaMatches(value: unknown, schema: any, root: any = schema, depth = 0): boolean {
+  // A host's TypeBox-compatible builder may not be plain JSON Schema: OMP's
+  // legacy typebox shim returns an omptype callable exposing toJsonSchema().
+  // Lower it once; plain schemas (pi's typebox) pass through untouched.
+  if (typeof schema?.toJsonSchema === "function") {
+    const plain = schema.toJsonSchema();
+    if (root === schema) root = plain;
+    schema = plain;
+  }
   if (!object(schema) || depth > 16) return false;
   if (schema.$ref) {
     if (typeof schema.$ref !== "string" || !schema.$ref.startsWith("#/")) return false;

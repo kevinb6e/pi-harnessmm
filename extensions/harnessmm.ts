@@ -11,7 +11,7 @@
  *   integrations/deepseek_harness/cot_jev.mjs, sar_v2.mjs, sar_admission.mjs
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Context as ModelContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { parseBank, type Bank, type BankState, type PublicResult, type ToolContract } from "../src/bank.ts";
@@ -68,15 +68,33 @@ export default function harnessmm(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => restore(ctx));
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
 
-  // The authoring instruction is the upstream text for this policy version. It goes
-  // into a prompt section so pi patches only that section instead of replacing the
-  // whole system prompt, which keeps the cached prefix stable across turns.
+  // The authoring instruction is the upstream text for this policy version. pi puts
+  // it into a named prompt section so only that section is patched, keeping the
+  // cached prefix stable across turns. OMP has no sections: its event carries the
+  // base prompt as an array and takes a chained complete replacement, so append the
+  // instruction as one more element — the leading bytes stay identical either way.
   pi.on("before_agent_start", async (event) => {
     if (!policy.enabled) return;
-    event.systemPromptOptions.sections = {
-      ...event.systemPromptOptions.sections,
-      "harnessmm-authoring": planInstruction(policy),
+    const host = event as unknown as {
+      systemPromptOptions?: { sections?: Record<string, string> };
+      systemPrompt?: string | string[];
+      reason?: string;
     };
+    const instruction = planInstruction(policy);
+    if (host.systemPromptOptions) {
+      host.systemPromptOptions.sections = {
+        ...host.systemPromptOptions.sections,
+        "harnessmm-authoring": instruction,
+      };
+      return;
+    }
+    // OMP: a revive fires this event with its result discarded; skip the work.
+    if (host.reason === "revive") return;
+    if (Array.isArray(host.systemPrompt)) {
+      // OMP's result type is string[] where pi's is string; the cast satisfies
+      // pi's handler type while OMP reads the array at runtime.
+      return { systemPrompt: [...host.systemPrompt, instruction] } as unknown as { systemPrompt?: string };
+    }
   });
 
   // Remove the authored bank from the slow context, preserving every native action.
@@ -122,7 +140,11 @@ export default function harnessmm(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  // OMP mounts extension tools whose loadMode defaults to "discoverable" under
+  // xd:// (the model then reaches them through a `write` call), which breaks the
+  // bank contract's "exactly one registered native root" check. "essential" keeps
+  // `terminal` top-level there; pi ignores the field.
+  const toolDefinition: ToolDefinition<typeof TERMINAL_PARAMETERS> & { loadMode?: "essential" } = {
     name: "terminal",
     label: "Terminal",
     description: [
@@ -261,11 +283,23 @@ export default function harnessmm(pi: ExtensionAPI) {
         },
       };
     },
-  });
+    loadMode: "essential",
+  };
+  pi.registerTool(toolDefinition);
 }
 
-/** Dispatch one admitted action through the registered `terminal` tool. */
+/**
+ * Dispatch one admitted action through the registered `terminal` tool. pi provides
+ * `ctx.executeTool` so hooks and permission checks see the nested call. OMP exposes
+ * no such dispatch — `ctx.invokeTool` only reaches a native built-in of the same
+ * name, and `terminal` is net-new there (its shell tool is `bash`) — so the same
+ * terminal code path runs directly: identical receipt, identical privileges,
+ * inside the already-approved root call.
+ */
 async function callNative(ctx: ExtensionToolContext, args: { command: string; cwd?: string; timeout_sec?: number }, signal?: AbortSignal): Promise<TerminalReceipt> {
+  if (typeof ctx.executeTool !== "function") {
+    return runTerminal(args, { cwd: ctx.cwd, signal });
+  }
   const outcome = await ctx.executeTool("terminal", args, { signal });
   const text = outcome.result.content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -291,26 +325,71 @@ function previousToolCallId(messages: PiMessage[], authoringIndex: number): stri
   return undefined;
 }
 
+/** The parts of a model answer the selector reads, from either host. */
+interface SelectorAnswer {
+  content: Array<{ type: string; text?: string }>;
+  usage?: { input?: number; output?: number; totalTokens?: number };
+}
+
+/** Host model-call surfaces: pi has `modelRegistry.complete`, OMP has `runEphemeralTurn`. */
+interface SelectorHost {
+  modelRegistry: {
+    complete?: (model: unknown, context: ModelContext, options: { maxTokens: number; temperature: number }) => Promise<SelectorAnswer>;
+  };
+  runEphemeralTurn?: (options: { promptText: string; tools: false; maxTokens: number; dedupeReply: boolean; minimizeEffort?: boolean }) => Promise<{
+    replyText: string;
+    assistantMessage?: { usage?: SelectorAnswer["usage"] };
+  }>;
+}
+
 /**
  * One-token style selector: ask the session model for a single label.
  * pi exposes no logprobs, so this verifies the reply shape instead of a
  * probability, and any other reply abstains back to slow reasoning.
+ * OMP's `modelRegistry` is a catalog with no `complete()`, so the selector
+ * travels as an ephemeral side turn (no custom system prompt there — the
+ * instruction rides in the prompt text) under the same abstention contract.
  */
 async function selectLabel(ctx: ExtensionToolContext, system: string, state: unknown, labels: string[]): Promise<{ label: string; usage?: { inputTokens: number; outputTokens: number; totalTokens: number } }> {
+  const host = ctx as unknown as SelectorHost;
   const model = ctx.model;
-  if (!model) return { label: "?" };
-  const context: ModelContext = {
-    systemPrompt: system,
-    messages: [{ role: "user", content: [{ type: "text", text: JSON.stringify(state) }], timestamp: Date.now() }],
-  };
-  const answer = await ctx.modelRegistry.complete(model, context, { maxTokens: 1, temperature: 0 });
-  const reply = answer.content
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map(part => part.text)
-    .join("")
-    .trim();
-  const usage = answer.usage
-    ? { inputTokens: answer.usage.input ?? 0, outputTokens: answer.usage.output ?? 0, totalTokens: answer.usage.totalTokens ?? 0 }
+  let reply: string;
+  let raw: SelectorAnswer["usage"];
+  if (model && typeof host.modelRegistry?.complete === "function") {
+    const context: ModelContext = {
+      systemPrompt: system,
+      messages: [{ role: "user", content: [{ type: "text", text: JSON.stringify(state) }], timestamp: Date.now() }],
+    };
+    const answer = await host.modelRegistry.complete(model, context, { maxTokens: 1, temperature: 0 });
+    reply = answer.content
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map(part => part.text)
+      .join("")
+      .trim();
+    raw = answer.usage;
+  } else if (typeof host.runEphemeralTurn === "function") {
+    try {
+      const outcome = await host.runEphemeralTurn({
+        promptText: `${system}\n\nState: ${JSON.stringify(state)}`,
+        tools: false,
+        // A reasoning model spends a one-token budget on thinking and returns no
+        // text at all (verified: reply "", reasoning == output). A wider budget
+        // plus lowest-effort mode gets a visible label; anything that is not
+        // exactly one declared label still abstains.
+        maxTokens: 256,
+        dedupeReply: false,
+        minimizeEffort: true,
+      });
+      reply = outcome.replyText.trim();
+      raw = outcome.assistantMessage?.usage;
+    } catch {
+      return { label: "?" };
+    }
+  } else {
+    return { label: "?" };
+  }
+  const usage = raw
+    ? { inputTokens: raw.input ?? 0, outputTokens: raw.output ?? 0, totalTokens: raw.totalTokens ?? 0 }
     : undefined;
   return labels.includes(reply) ? { label: reply, ...(usage ? { usage } : {}) } : { label: "?", ...(usage ? { usage } : {}) };
 }

@@ -35,6 +35,11 @@
       "./extensions/harnessmm.ts"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./extensions/harnessmm.ts"
+    ]
+  },
   "scripts": {
     "test": "node --test 'tests/*.test.ts'",
     "typecheck": "tsc --noEmit",

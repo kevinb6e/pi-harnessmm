@@ -32,6 +32,34 @@ pi -e ./pi-harnessmm
 The extension registers the `terminal` tool. It replaces `bash` for work that benefits from a bank: one tool, one
 receipt shape `{return_code, stdout, stderr}`, and no merged streams.
 
+### OMP (oh-my-pi)
+
+The same entry runs under [OMP](https://github.com/can1357/oh-my-pi) (v18+) through its legacy-pi compat layer:
+`package.json#pi.extensions` is still accepted, `@earendil-works/*` specifiers are rewritten to the host copies,
+and the `typebox` import resolves to OMP's shim. OMP does **not** read pi's `~/.pi/agent/settings.json` packages,
+so install it explicitly:
+
+```bash
+omp install git:github.com/jlon/pi-harnessmm   # or: omp install ./pi-harnessmm
+# or list the checkout in ~/.omp/agent/config.yml:  extensions: [ /path/to/pi-harnessmm ]
+# or run ad hoc:                                      omp -e ./extensions/harnessmm.ts
+```
+
+Three host deltas are feature-detected in `extensions/harnessmm.ts`, plus two host-shape normalizations in
+`src/bank.ts` (`schemaMatches` lowers a TypeBox builder through `toJsonSchema()` — OMP's typebox shim returns an
+omptype callable, not plain JSON Schema) and `loadMode: "essential"` on the tool (OMP would otherwise mount the
+net-new `terminal` under `xd://`, so the root call is recorded as `write` and the bank contract's root check
+fails):
+
+| Step | pi | OMP |
+| --- | --- | --- |
+| authoring instruction | prompt section patched in place (`systemPromptOptions.sections`) | returned `{systemPrompt: [...base, instruction]}` override — chained, base preserved, prefix-stable |
+| substitute dispatch | `ctx.executeTool("terminal", …)` re-enters the tool pipeline | no nested-dispatch API exists (`ctx.invokeTool` reaches only a native built-in of the same name; `terminal` is net-new, OMP's shell tool is `bash`) → the same `runTerminal` path runs directly inside the already-approved root call |
+| selector | `ctx.modelRegistry.complete(…, {maxTokens: 1})` | `modelRegistry` is a catalog; the selector rides an `ctx.runEphemeralTurn({promptText, tools: false, maxTokens: 256, minimizeEffort})` side turn with the same abstain-on-anything-else contract, usage read from `assistantMessage.usage` (a reasoning model spends a one-token budget on thinking and returns no text, hence the wider budget) |
+
+Under OMP, admitted substitutes therefore do not fire `tool_call`/`tool_result` hooks (everything else —
+bank contract, guards, admission, certificates, projection, `/harnessmm` — is identical).
+
 ## The authoring contract
 
 The instruction appended to the system prompt is the reference text for the configured policy version, byte for
@@ -133,10 +161,12 @@ pi is not a DSH/Chat-completions harness, so three things cannot be ported 1:1:
    admitted successor execute there and their receipts are returned together. Same decisions, same certificates, same
    economics (N dependent steps per model turn), one fewer transcript entry per substitution. Each substitute is
    dispatched back through the registered `terminal` tool (`ctx.executeTool`), so pi's `tool_call`/`tool_result` hooks
-   and every other extension's permission checks see it, and pi records it as a nested call on the result.
+   and every other extension's permission checks see it, and pi records it as a nested call on the result. Under OMP
+   no equivalent dispatch exists, so substitutes run through the same terminal code path directly (see the OMP table
+   above).
 2. **No logprobs.** The reference selector requires a one-token reply with a native logprob. `pi` exposes no
    logprobs, so the selector asks the session model for one label, accepts only a label it offered, and treats
-   everything else as abstention.
+   everything else as abstention. Under OMP the same check runs over an `runEphemeralTurn` side-turn reply.
 3. **No RSI loop.** Recursive self-improvement is an offline training pipeline over datasets and graders
    (`phiagent/harness/industrial_*`), not a runtime mechanism. This package implements the runtime adapter only;
    policy versions 8 and 10 consume its output through `HARNESSMM_TRAIN_PRIORS`.
